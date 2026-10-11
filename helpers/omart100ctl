@@ -1,0 +1,1364 @@
+#!/usr/bin/env python3
+"""Talk to an Epomaker RT100 keyboard over its USB cable.
+
+The plugin runs `omart100ctl daemon` once. The daemon owns the keyboard: it
+feeds CPU load and temperature to the screen, keeps the key lights on the
+Omarchy theme's window border colour, and runs picture and GIF uploads one at
+a time so nothing fights over the device. Every other command talks to the
+daemon over a socket and prints JSON.
+
+It uses the keyboard's control interface (USB interface 2) through
+/dev/hidraw, so it needs only Python and Pillow, and no root once the udev rule
+from the README is installed. Interface 0 carries typing and is never opened.
+
+Usage:
+  omart100ctl daemon
+  omart100ctl status
+  omart100ctl show <file or link> [place]
+                                    (picks picture or GIF; GIPHY page links work;
+                                     place = {"zoom": 1, "x": 0, "y": 0})
+  omart100ctl fetch <file or link>  (checks it and downloads links, for the window's
+                                     adjust step; prints {"path", "kind"})
+  omart100ctl image <file>          (still picture; GIFs go through `gif`)
+  omart100ctl gif <file>
+  omart100ctl lights theme          (keys follow the theme's window border)
+  omart100ctl lights custom <json>  ({"<led>": "#rrggbb", ...}; missing keys are off)
+  omart100ctl lights effect <json>  ({"effect": "breathing", "speed": 0-4,
+                                      "brightness": 0-4, "rainbow": true,
+                                      "direction": 0-3, "color": "#rrggbb"})
+  omart100ctl effects               (the built-in effect names)
+  omart100ctl profiles              (saved profiles)
+  omart100ctl profile save <name>   (current lights + screen picture or GIF)
+  omart100ctl profile apply <id>
+  omart100ctl profile delete <id>
+  omart100ctl macros                (saved macros and the keys they're on)
+  omart100ctl macro save            (one line of JSON on stdin: {"id", "name", "steps": [{"usage", "down", "delay"}],
+                                      "timing": "recorded"|"fast", "plays": "once"|"held"|"toggle",
+                                      "times": 1-99, "key": {"slot", "fn", "label"} or null})
+  omart100ctl macro delete <id>     (puts the key back the way it was)
+  omart100ctl keymap                (Fn + key combinations already in use)
+
+The packet formats come from strodgers/epomaker-controller (MIT), and the key
+positions from dwaycik/epomaker-rt100 (MIT). Uploads are paced: sent
+back-to-back, an RT100 shows "100%" but keeps only part of the picture.
+"""
+
+import fcntl
+import glob
+import json
+import os
+import re
+import select
+import signal
+import socket
+import sys
+import threading
+import time
+from datetime import datetime
+
+VENDOR = 0x3151
+WIRED_PRODUCTS = (0x4010, 0x4015)
+CONTROL_INTERFACE = 2
+REPORT_LEN = 64
+DATA_LEN = REPORT_LEN - 8
+MAX_LED = 101                     # highest key light on an RT100
+
+SCREEN_SIZE = (162, 173)          # width, height of a still picture
+GIF_SIZE = (128, 160)             # largest animation size the firmware takes
+GIF_MAX_FRAMES = 56
+GIF_FRAME_MS = 66
+
+ERASE_DELAY = 1.0                 # pause after an upload's first report
+IMAGE_PACKET_DELAY = 0.005
+KEY_ERASE_DELAY = 0.25
+KEY_PACKET_DELAY = 0.010
+KEY_FRAME_GAP = 1.0               # colour frames sent closer than this can
+                                  # knock the RT100 back to plain white
+FIELD_SPACING = 1.6               # the screen drops a value sent sooner
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "omart100")
+SOCKET_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or STATE_DIR, "omart100.sock")
+THEME_DIR = os.path.expanduser("~/.local/state/omarchy/current/theme")
+
+
+# --------------------------------------------------------------------------- #
+# Device
+# --------------------------------------------------------------------------- #
+
+def _ioc_set_feature(length):
+    # _IOC(_IOC_WRITE | _IOC_READ, 'H', 0x06, length)
+    return (3 << 30) | (length << 16) | (ord("H") << 8) | 0x06
+
+
+def _ioc_get_feature(length):
+    # _IOC(_IOC_WRITE | _IOC_READ, 'H', 0x07, length)
+    return (3 << 30) | (length << 16) | (ord("H") << 8) | 0x07
+
+
+def find_control_node():
+    """The /dev/hidraw node for interface 2 of a wired RT100, or None."""
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(os.path.join(node, "device", "uevent")) as fh:
+                uevent = fh.read()
+        except OSError:
+            continue
+        match = re.search(r"HID_ID=\w+:0*([0-9A-Fa-f]+):0*([0-9A-Fa-f]+)", uevent)
+        if not match:
+            continue
+        vendor, product = int(match.group(1), 16), int(match.group(2), 16)
+        if vendor != VENDOR or product not in WIRED_PRODUCTS:
+            continue
+        real = os.path.realpath(os.path.join(node, "device"))
+        if re.search(r":1\.%d/" % CONTROL_INTERFACE, real + "/"):
+            return "/dev/" + os.path.basename(node)
+    return None
+
+
+class Keyboard:
+    def __init__(self, path):
+        self.path = path
+        self.fd = os.open(path, os.O_RDWR)
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+    def send(self, report):
+        buf = bytearray(report)
+        if len(buf) != REPORT_LEN:
+            raise ValueError("report must be %d bytes" % REPORT_LEN)
+        fcntl.ioctl(self.fd, _ioc_set_feature(REPORT_LEN), buf)
+
+    def exchange(self, header7, payload=b"", expect=None):
+        """Send a command and read the keyboard's 64-byte reply."""
+        for _attempt in range(3):
+            self.send(_data_report(header7, payload))
+            time.sleep(0.02)
+            buf = bytearray(REPORT_LEN + 1)
+            count = fcntl.ioctl(self.fd, _ioc_get_feature(len(buf)), buf, True)
+            reply = bytes(buf[1:count]) if count == REPORT_LEN + 1 else bytes(buf[:count])
+            if len(reply) == REPORT_LEN and (expect is None or reply[0] == expect):
+                return reply
+            time.sleep(0.1)
+        raise OSError("The keyboard didn't answer.")
+
+    def send_paced(self, reports, erase_delay, packet_delay, progress=None):
+        total = len(reports)
+        for index, report in enumerate(reports):
+            self.send(report)
+            if index == 0 and erase_delay:
+                time.sleep(erase_delay)
+            elif packet_delay:
+                time.sleep(packet_delay)
+            if progress and (index % 50 == 0 or index + 1 == total):
+                progress(index + 1, total)
+
+
+# --------------------------------------------------------------------------- #
+# Reports
+# --------------------------------------------------------------------------- #
+
+def _pad(data):
+    data = bytes(data)
+    return data + bytes(REPORT_LEN - len(data))
+
+
+def _checksum(header):
+    return (0xFF - (sum(header) & 0xFF)) & 0xFF
+
+
+def _data_report(header7, payload):
+    header = bytes(header7)
+    return _pad(header + bytes([_checksum(header)]) + bytes(payload))
+
+
+def time_report(now=None):
+    now = now or datetime.now()
+    body = bytes.fromhex("28000000000000d7") + now.year.to_bytes(2, "big") + bytes(
+        [now.month, now.day, now.hour, now.minute, now.second])
+    return _pad(body)
+
+
+def cpu_report(percent):
+    return _pad(bytes.fromhex("22000000000000dd63007f0004000800") + bytes([percent]))
+
+
+def temp_report(celsius):
+    return _pad(bytes.fromhex("2a000000000000d5") + bytes([celsius]))
+
+
+def key_reports(led_colors):
+    """One static frame: {led index: (r, g, b)}; every other LED off."""
+    data = bytearray(7 * DATA_LEN)
+    for led, rgb in led_colors.items():
+        for i, value in enumerate(rgb):
+            pos = led * 3 + i
+            if 0 <= pos < len(data):
+                data[pos] = max(0, min(255, int(value)))
+    reports = [_pad(bytes.fromhex("18000000000000e7"))]
+    for part in range(7):
+        header = bytes([0x19, part, 0, 1, 0, 0, 0])
+        reports.append(_data_report(header, data[part * DATA_LEN:(part + 1) * DATA_LEN]))
+    return reports
+
+
+# The keyboard's built-in effects: (name, label, firmware mode, directions).
+# Mode numbers from OpenRGB's EpomakerController.h via epomaker-controller.
+EFFECTS = [
+    ("always-on", "Always on", 0x01, 0),
+    ("breathing", "Breathing", 0x02, 0),
+    ("spectrum", "Spectrum cycle", 0x03, 0),
+    ("drift", "Drift", 0x04, 4),
+    ("ripple", "Ripple", 0x05, 0),
+    ("twinkle", "Twinkle", 0x06, 0),
+    ("stream", "Stream", 0x07, 2),
+    ("shadowing", "Shadowing", 0x08, 0),
+    ("peaks", "Peaks", 0x09, 0),
+    ("sine", "Sine wave", 0x0A, 0),
+    ("surge", "Surge", 0x0B, 2),
+    ("bloom", "Bloom", 0x0C, 2),
+    ("laser", "Laser", 0x0E, 0),
+    ("spin", "Spin", 0x0F, 2),
+    ("rain", "Rain", 0x10, 0),
+    ("snow", "Snow", 0x11, 0),
+    ("meteor", "Meteor", 0x12, 0),
+    ("snow-trail", "Snow trail", 0x13, 0),
+    ("light-shadow", "Light and shadow", 0x15, 0),
+]
+EFFECT_BY_NAME = {e[0]: e for e in EFFECTS}
+
+
+def effect_report(name, speed=4, brightness=4, rainbow=False, direction=0, color="#ffffff"):
+    _, _, mode, directions = EFFECT_BY_NAME[name]
+    option = (min(int(direction), directions - 1) << 4) if directions else 0
+    option |= 0x08 if rainbow else 0x07
+    r, g, b = _rgb(color)
+    body = bytes([0x07, mode, max(0, min(4, int(speed))), max(0, min(4, int(brightness))),
+                  option, r, g, b])
+    return _pad(body + bytes([_checksum(body)]))
+
+
+def _rgb565_transposed(image):
+    """Pixel bytes in the order the firmware reads them: column by column."""
+    width, height = image.size
+    pixels = image.load()
+    out = bytearray(width * height * 2)
+    pos = 0
+    for x in range(width):
+        for y in range(height):
+            r, g, b = pixels[x, y][:3]
+            value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+            out[pos] = value >> 8
+            out[pos + 1] = value & 0xFF
+            pos += 2
+    return bytes(out)
+
+
+def upload_reports(frames, size, delay_ms):
+    """Init report plus 0x38 data / 0x34 footer reports for each frame."""
+    width, height = size
+    per_frame = width * height * 2
+    init = bytearray([0xA5, 0x00, len(frames) & 0xFF, min(delay_ms, 255),
+                      per_frame & 0xFF, (per_frame >> 8) & 0xFF, 0x00])
+    init.append(_checksum(init))
+    init += bytes([0x00, 0x00, width & 0xFF, height & 0xFF])
+    reports = [_pad(init)]
+    per_report_count = -(-per_frame // DATA_LEN)
+    for number, frame in enumerate(frames, start=1):
+        raw = _rgb565_transposed(frame)
+        for seq in range(per_report_count):
+            kind = 0x34 if seq == per_report_count - 1 else 0x38
+            header = bytes([0x25, 0x00, number & 0xFF, 0x00, seq & 0xFF, seq >> 8, kind])
+            chunk = raw[seq * DATA_LEN:(seq + 1) * DATA_LEN]
+            reports.append(_data_report(header, chunk + bytes(DATA_LEN - len(chunk))))
+    return reports
+
+
+# --------------------------------------------------------------------------- #
+# Pictures
+# --------------------------------------------------------------------------- #
+
+def clean_place(place):
+    """Zoom and shift chosen in the window. zoom 1 fills the screen; x and y
+    move the picture by that share of the screen's width and height."""
+    place = place if isinstance(place, dict) else {}
+    def num(key, low, high, default):
+        try:
+            return max(low, min(high, float(place.get(key, default))))
+        except (TypeError, ValueError):
+            return default
+    return {"zoom": num("zoom", 0.2, 5.0, 1.0), "x": num("x", -1.0, 1.0, 0.0),
+            "y": num("y", -1.0, 1.0, 0.0)}
+
+
+def _fit(image, size, place=None):
+    """Scale to fill `size` (times zoom), centred, then shifted; bars are black."""
+    from PIL import Image
+    place = clean_place(place)
+    image = image.convert("RGB")
+    width, height = size
+    scale = max(width / image.width, height / image.height) * place["zoom"]
+    scaled = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                          Image.LANCZOS)
+    canvas = Image.new("RGB", size, (0, 0, 0))
+    left = round((width - scaled.width) / 2 + place["x"] * width)
+    top = round((height - scaled.height) / 2 + place["y"] * height)
+    canvas.paste(scaled, (left, top))
+    return canvas
+
+
+def still_reports(path, place=None):
+    from PIL import Image
+    with Image.open(path) as image:
+        image.seek(0)
+        return upload_reports([_fit(image, SCREEN_SIZE, place)], SCREEN_SIZE, 0)
+
+
+def gif_reports(path, place=None):
+    from PIL import Image
+    with Image.open(path) as gif:
+        total = getattr(gif, "n_frames", 1)
+        count = min(total, GIF_MAX_FRAMES)
+        step = total / count
+        canvas = Image.new("RGBA", gif.size, (0, 0, 0, 255))
+        frames = []
+        wanted = {int(i * step) for i in range(count)}
+        for index in range(total):
+            gif.seek(index)
+            layer = gif.convert("RGBA")
+            canvas.alpha_composite(layer)
+            if index in wanted:
+                frames.append(_fit(canvas, GIF_SIZE, place))
+            if getattr(gif, "disposal_method", 0) == 2:
+                canvas = Image.new("RGBA", gif.size, (0, 0, 0, 255))
+    delay = int(GIF_FRAME_MS * step)
+    return upload_reports(frames, GIF_SIZE, delay)
+
+
+# --------------------------------------------------------------------------- #
+# Theme and sensors
+# --------------------------------------------------------------------------- #
+
+def load_layout():
+    with open(os.path.join(HERE, "rt100-layout.json")) as fh:
+        return json.load(fh)
+
+
+_HEX = re.compile(r"(?:#|rgba?\()([0-9A-Fa-f]{6})(?:[0-9A-Fa-f]{2})?")
+
+
+def theme_border_colors():
+    """The active window border colours (one, or a gradient's stops)."""
+    try:
+        with open(os.path.join(THEME_DIR, "hyprland.lua")) as fh:
+            text = fh.read()
+        match = re.search(r"active_border_color\s*=\s*(\{[^}]*\}[^\n]*|[^\n]+)", text)
+        if match:
+            colors = _HEX.findall(match.group(1))
+            if colors:
+                return ["#" + c.lower() for c in colors]
+    except OSError:
+        pass
+    for name, pattern in (("keyboard.rgb", r"#?([0-9A-Fa-f]{6})"),
+                          ("colors.toml", r'accent\s*=\s*"#([0-9A-Fa-f]{6})"')):
+        try:
+            with open(os.path.join(THEME_DIR, name)) as fh:
+                found = re.search(pattern, fh.read())
+            if found:
+                return ["#" + found.group(1).lower()]
+        except OSError:
+            pass
+    return ["#ffffff"]
+
+
+def _rgb(hex_color):
+    value = hex_color.lstrip("#")
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def gradient_colors(layout, stops):
+    """Spread colour stops across the keyboard from left to right."""
+    colors = [_rgb(c) for c in stops]
+    lit = [k for k in layout if k["led"] >= 0]      # numpad Enter has no light
+    if len(colors) == 1:
+        return {k["led"]: colors[0] for k in lit}
+    right = max(k["x"] + k["w"] for k in layout)
+    result = {}
+    for key in lit:
+        t = (key["x"] + key["w"] / 2) / right * (len(colors) - 1)
+        i = min(int(t), len(colors) - 2)
+        f = t - i
+        a, b = colors[i], colors[i + 1]
+        result[key["led"]] = tuple(round(a[c] + (b[c] - a[c]) * f) for c in range(3))
+    return result
+
+
+def theme_signature():
+    parts = []
+    for name in ("hyprland.lua", "keyboard.rgb", "colors.toml"):
+        try:
+            st = os.stat(os.path.join(THEME_DIR, name))
+            parts.append("%s:%d:%d" % (name, st.st_mtime_ns, st.st_ino))
+        except OSError:
+            parts.append(name + ":-")
+    try:
+        parts.append(os.path.realpath(THEME_DIR))
+    except OSError:
+        pass
+    return "|".join(parts)
+
+
+def _temp_input():
+    """Path of the CPU package temperature, best source first."""
+    preferred = (("coretemp", "Package id 0"), ("k10temp", "Tctl"), ("zenpower", "Tdie"))
+    for chip, label in preferred:
+        for hwmon in glob.glob("/sys/class/hwmon/hwmon*"):
+            try:
+                if open(os.path.join(hwmon, "name")).read().strip() != chip:
+                    continue
+            except OSError:
+                continue
+            for lab in glob.glob(os.path.join(hwmon, "temp*_label")):
+                try:
+                    if open(lab).read().strip() == label:
+                        return lab.replace("_label", "_input")
+                except OSError:
+                    pass
+            first = os.path.join(hwmon, "temp1_input")
+            if os.path.exists(first):
+                return first
+    for zone in glob.glob("/sys/class/thermal/thermal_zone*"):
+        try:
+            if open(os.path.join(zone, "type")).read().strip() == "x86_pkg_temp":
+                return os.path.join(zone, "temp")
+        except OSError:
+            pass
+    return None
+
+
+def read_temp(path):
+    try:
+        with open(path) as fh:
+            return max(1, min(99, round(int(fh.read()) / 1000)))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+class CpuMeter:
+    def __init__(self):
+        self.last = self._sample()
+
+    @staticmethod
+    def _sample():
+        with open("/proc/stat") as fh:
+            fields = [int(v) for v in fh.readline().split()[1:]]
+        idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
+        return idle, sum(fields)
+
+    def percent(self):
+        idle, total = self._sample()
+        d_idle, d_total = idle - self.last[0], total - self.last[1]
+        self.last = (idle, total)
+        if d_total <= 0:
+            return 0
+        return max(0, min(99, round(100 * (d_total - d_idle) / d_total)))
+
+
+SETTINGS_PATH = os.path.join(STATE_DIR, "settings.json")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def private_state_dir():
+    """~/.local/state/omart100, readable only by you."""
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+
+
+def write_private_json(path, data):
+    """Atomic replace through a random temp file, created 0600."""
+    import tempfile
+    private_state_dir()
+    fd, temp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh, indent=1)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+def save_settings(data):
+    write_private_json(SETTINGS_PATH, data)
+
+
+_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def clean_lights(lights):
+    """Check a lights setting from the window before it reaches the keyboard."""
+    if not isinstance(lights, dict):
+        raise ValueError("Lights setting is missing.")
+    mode = lights.get("mode")
+    if mode == "theme":
+        return {"mode": "theme"}
+    if mode == "custom":
+        custom = lights.get("custom")
+        if not isinstance(custom, dict):
+            raise ValueError("Custom colours are missing.")
+        clean = {}
+        for led, color in custom.items():
+            # Lights 0-101. Higher numbers make the RT100 drop the whole
+            # frame and fall back to plain white.
+            if str(led).isdigit() and int(led) <= MAX_LED and _COLOR.match(str(color)):
+                clean[str(int(led))] = str(color).lower()
+        return {"mode": "custom", "custom": clean}
+    if mode == "effect":
+        effect = lights.get("effect")
+        if not isinstance(effect, dict) or effect.get("effect") not in EFFECT_BY_NAME:
+            raise ValueError("Unknown effect.")
+        color = str(effect.get("color", "#ffffff"))
+        def level(key, default, top):
+            try:
+                return max(0, min(top, int(effect.get(key, default))))
+            except (TypeError, ValueError):
+                return default
+        return {"mode": "effect", "effect": {
+            "effect": effect["effect"], "speed": level("speed", 4, 4),
+            "brightness": level("brightness", 4, 4), "rainbow": bool(effect.get("rainbow")),
+            "direction": level("direction", 0, 3),
+            "color": color.lower() if _COLOR.match(color) else "#ffffff"}}
+    raise ValueError("Lights mode must be theme, custom or effect.")
+
+
+def theme_palette():
+    """The theme's named colours, for the window's swatches."""
+    palette = []
+    try:
+        with open(os.path.join(THEME_DIR, "colors.toml")) as fh:
+            for name, value in re.findall(r'^\s*([a-z_]+)\s*=\s*"(#[0-9A-Fa-f]{6})"', fh.read(), re.M):
+                if "background" not in name and "selection" not in name and value.lower() not in palette:
+                    palette.append(value.lower())
+    except OSError:
+        pass
+    return palette[:16]
+
+
+# --------------------------------------------------------------------------- #
+# Macros: stored on the keyboard and played by its own firmware
+# --------------------------------------------------------------------------- #
+# Command numbers from ramarivera/epomaker-driver-linux (MIT, docs/yc3121.md),
+# checked on an RT100 (model 1379, firmware 264): 0x85 reads the keyboard's
+# own profile, 0x89/0x90 read the key and Fn layers, 0x13/0x15 set one key,
+# 0x8b/0x16 read and write a macro. Key slots are not light numbers; the
+# layout file carries both.
+
+MACROS_PATH = os.path.join(STATE_DIR, "macros.json")
+MACRO_SLOTS = range(1, 33)        # slot 0 holds Epomaker's sample macro
+MACRO_BYTES = 256
+KEY_SLOTS = 128
+FN_KEY_SLOT = 65                  # the Fn key itself is never rebound
+WRITE_SETTLE = 0.5                # the keyboard needs this after a key or macro write
+PLAYS = {"once": 0, "toggle": 1, "held": 2}
+FAST_DELAY = 10                   # ms between steps with "Fast" timing
+MAX_MACRO_JSON = 65536            # bytes read from stdin for one macro
+
+
+def load_macros():
+    try:
+        with open(MACROS_PATH) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_macros(macros):
+    # Recorded keystrokes can be private (typed text), so 0600 like settings.
+    write_private_json(MACROS_PATH, macros)
+
+
+def encode_macro(macro):
+    """The 256 bytes the keyboard stores: repeat count, then key events."""
+    repeat = macro["times"] if macro["plays"] == "once" else 1
+    data = bytearray(repeat.to_bytes(2, "little"))
+    for step in macro["steps"]:
+        delay = FAST_DELAY if macro["timing"] == "fast" else step["delay"]
+        flag = 0x80 if step["down"] else 0
+        if delay <= 127:
+            data += bytes([step["usage"], flag | delay])
+        else:
+            data += bytes([step["usage"], flag]) + delay.to_bytes(2, "little")
+    if len(data) > MACRO_BYTES:
+        raise ValueError("That macro is too long for the keyboard. Remove some steps.")
+    return bytes(data).ljust(MACRO_BYTES, b"\0")
+
+
+def clean_macro(macro):
+    """Check a macro from the window before it reaches the keyboard."""
+    if not isinstance(macro, dict):
+        raise ValueError("The macro is missing.")
+    name = " ".join(str(macro.get("name", "")).split())[:40]
+    if not name:
+        raise ValueError("Give the macro a name.")
+    steps = []
+    for step in macro.get("steps") or []:
+        try:
+            usage = int(step["usage"])
+            delay = int(step.get("delay", FAST_DELAY))
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("One of the steps is broken.")
+        if not 4 <= usage <= 231:
+            raise ValueError("One of the steps uses a key the keyboard can't send.")
+        steps.append({"usage": usage, "down": bool(step.get("down")),
+                      "delay": max(1, min(5000, delay)), "label": str(step.get("label", ""))[:12]})
+    if not steps:
+        raise ValueError("Record or type something first.")
+    try:
+        times = max(1, min(99, int(macro.get("times", 1))))
+    except (TypeError, ValueError):
+        times = 1
+    key = macro.get("key")
+    if key is not None:
+        try:
+            key = {"slot": int(key["slot"]), "fn": bool(key.get("fn")),
+                   "label": str(key.get("label", ""))[:16]}
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("Pick the key again.")
+        if not 0 <= key["slot"] < KEY_SLOTS or key["slot"] == FN_KEY_SLOT:
+            raise ValueError("That key can't hold a macro.")
+    clean = {"id": str(macro.get("id") or ""), "name": name, "steps": steps,
+             "timing": "fast" if macro.get("timing") == "fast" else "recorded",
+             "plays": macro.get("plays") if macro.get("plays") in PLAYS else "once",
+             "times": times, "key": key}
+    encode_macro(clean)                     # too long fails here, before the queue
+    return clean
+
+
+def keyboard_profile(kb):
+    return kb.exchange(bytes([0x85, 0, 0, 0, 0, 0, 0]), expect=0x85)[1]
+
+
+def read_layer_page(kb, fn, profile, page):
+    return kb.exchange(bytes([0x90 if fn else 0x89, 0 if fn else profile, page, 0, 0, 0, 0]))
+
+
+def read_layer(kb, fn, profile=0):
+    """All 128 four-byte key actions of the key layer or the Fn layer."""
+    return b"".join(read_layer_page(kb, fn, profile, page) for page in range(8))
+
+
+def write_key(kb, slot, action, fn, profile):
+    header = bytes([0x15, 0, slot, 0, 0, 0, 0]) if fn else bytes([0x13, profile, slot, 0, 0, 0, 0])
+    kb.send(_data_report(header, action))
+    time.sleep(WRITE_SETTLE)
+    page = read_layer_page(kb, fn, profile, slot // 16)
+    if page[(slot % 16) * 4:(slot % 16) * 4 + 4] != action:
+        raise ValueError("The keyboard didn't take the key change. Try again.")
+
+
+def read_macro(kb, macro_slot):
+    return b"".join(kb.exchange(bytes([0x8B, macro_slot, page, 0, 0, 0, 0])) for page in range(4))
+
+
+def write_macro(kb, macro_slot, data):
+    for chunk in range(5):                  # the last chunk is zero padded
+        header = bytes([0x16, macro_slot, chunk, DATA_LEN, int(chunk == 4), 0, 0])
+        kb.send(_data_report(header, data[chunk * DATA_LEN:(chunk + 1) * DATA_LEN]))
+        time.sleep(KEY_PACKET_DELAY)
+    time.sleep(WRITE_SETTLE)
+    if read_macro(kb, macro_slot) != data:
+        raise ValueError("The keyboard didn't keep the macro. Try again.")
+
+
+# --------------------------------------------------------------------------- #
+# Daemon
+# --------------------------------------------------------------------------- #
+
+class Daemon:
+    def __init__(self):
+        self.layout = load_layout()
+        self.keyboard = None
+        self.lock = threading.Lock()
+        self.jobs = []
+        self.jobs_cv = threading.Condition()
+        self.stopping = False
+        self.status = {"connected": False, "device": None, "cpu": None, "temp": None,
+                       "keys": None, "busy": None, "progress": None, "lastError": ""}
+        self.theme_sig = None
+        self.lights = load_settings().get("lights") or {"mode": "theme"}
+        self.last_key_frame = 0.0
+        self.temp_path = _temp_input()
+        self.cpu = CpuMeter()
+
+    # -- device lifecycle --
+
+    def _connect(self):
+        node = find_control_node()
+        if not node:
+            return False
+        try:
+            self.keyboard = Keyboard(node)
+        except OSError as exc:
+            self.status["lastError"] = "Can't open %s: %s" % (node, exc.strerror)
+            return False
+        self.status.update(connected=True, device=node, lastError="")
+        self.keyboard.send(time_report())
+        time.sleep(FIELD_SPACING)
+        self.theme_sig = None       # repaint keys on every (re)connect
+        return True
+
+    def _drop(self, exc=None):
+        if self.keyboard:
+            self.keyboard.close()
+        self.keyboard = None
+        self.status.update(connected=False, device=None)
+        if exc:
+            self.status["lastError"] = str(exc)
+
+    # -- work --
+
+    def _apply_keys(self):
+        lights = self.lights
+        mode = lights.get("mode")
+        wait = KEY_FRAME_GAP - (time.time() - self.last_key_frame)
+        if wait > 0:
+            time.sleep(wait)
+        self.last_key_frame = time.time()
+        if mode == "effect":
+            effect = lights.get("effect") or {}
+            self.keyboard.send(effect_report(
+                effect.get("effect", "always-on"), effect.get("speed", 4),
+                effect.get("brightness", 4), effect.get("rainbow", False),
+                effect.get("direction", 0), effect.get("color", "#ffffff")))
+            stops = [] if effect.get("rainbow") else [effect.get("color", "#ffffff")]
+        elif mode == "custom":
+            custom = lights.get("custom") or {}
+            colors = {int(led): _rgb(c) for led, c in custom.items()}
+            self.keyboard.send_paced(key_reports(colors), KEY_ERASE_DELAY, KEY_PACKET_DELAY)
+            stops = sorted(set(custom.values()))[:8]
+        else:
+            stops = theme_border_colors()
+            colors = gradient_colors(self.layout, stops)
+            self.keyboard.send_paced(key_reports(colors), KEY_ERASE_DELAY, KEY_PACKET_DELAY)
+        self.status["keys"] = dict(lights, colors=stops)
+
+    def _run_job(self, job):
+        kind = job["kind"]
+        self.status.update(busy=kind, progress=0)
+        try:
+            if kind in ("image", "gif"):
+                build = gif_reports if kind == "gif" else still_reports
+                reports = build(job["path"], job.get("place") or {})
+
+                def progress(done, total):
+                    self.status["progress"] = round(100 * done / total)
+
+                self.keyboard.send_paced(reports, ERASE_DELAY, IMAGE_PACKET_DELAY, progress)
+                time.sleep(FIELD_SPACING)
+            elif kind == "lights":
+                self.lights = job["lights"]
+                self._apply_keys()
+                self.theme_sig = theme_signature()
+                settings = load_settings()
+                settings["lights"] = self.lights
+                save_settings(settings)
+            elif kind == "macro-save":
+                job["result"] = self._save_macro(job["macro"])
+            elif kind == "macro-delete":
+                job["result"] = self._delete_macro(job["id"])
+            elif kind == "keymap":
+                job["result"] = self._keymap()
+            job.setdefault("result", {"ok": True})
+        except (OSError, ValueError) as exc:
+            job["result"] = {"ok": False, "error": str(exc)}
+            if isinstance(exc, OSError) and exc.errno not in (None, 2):
+                self._drop(exc)
+        except Exception as exc:  # a bad picture file, mostly
+            job["result"] = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+        finally:
+            self.status.update(busy=None, progress=None)
+            job["done"].set()
+
+    # -- macros --
+
+    def _keymap(self):
+        """Which Fn + key combinations already do something (2.4G, media, ...)."""
+        kb = self.keyboard
+        fn_layer = read_layer(kb, True)
+        actions = [fn_layer[slot * 4:slot * 4 + 4] for slot in range(KEY_SLOTS)]
+        # Our own macros (action type 9) don't count; they can be moved.
+        taken = [slot for slot, action in enumerate(actions) if any(action) and action[0] != 9]
+        return {"ok": True, "profile": keyboard_profile(kb), "fnTaken": taken}
+
+    def _unbind(self, bound):
+        write_key(self.keyboard, bound["slot"], bytes.fromhex(bound["original"]),
+                  bound["fn"], bound["profile"])
+
+    def _save_macro(self, macro):
+        kb = self.keyboard
+        macros = load_macros()
+        old = next((m for m in macros if macro["id"] and m.get("id") == macro["id"]), None)
+        if old:
+            macro_slot = old["macroSlot"]
+        else:
+            used = {m.get("macroSlot") for m in macros}
+            free = [slot for slot in MACRO_SLOTS if slot not in used]
+            if not free:
+                raise ValueError("The keyboard holds %d macros. Delete one first." % len(MACRO_SLOTS))
+            macro_slot = free[0]
+            macro["id"] = "m%d-%d" % (macro_slot, int(time.time()))
+        macro["macroSlot"] = macro_slot
+        key = macro["key"]
+        if key:
+            for other in macros:
+                bound = other.get("bound")
+                if other is not old and bound and bound["slot"] == key["slot"] and bound["fn"] == key["fn"]:
+                    raise ValueError("%s is already on that key. Take it off first." % other["name"])
+        write_macro(kb, macro_slot, encode_macro(macro))
+
+        bound = old.get("bound") if old else None
+        same_key = bool(bound and key and bound["slot"] == key["slot"] and bound["fn"] == key["fn"])
+        if bound and not same_key:
+            self._unbind(bound)
+            bound = None
+        if key:
+            if same_key:
+                original, profile = bound["original"], bound["profile"]
+            else:
+                profile = keyboard_profile(kb)
+                layer = read_layer(kb, key["fn"], profile)
+                current = layer[key["slot"] * 4:key["slot"] * 4 + 4]
+                if key["fn"] and current != bytes(4):
+                    raise ValueError("Fn + %s already does something. Pick another key." % (key["label"] or "that key"))
+                original = current.hex()
+            write_key(kb, key["slot"], bytes([9, PLAYS[macro["plays"]], macro_slot, 0]), key["fn"], profile)
+            bound = {"slot": key["slot"], "fn": key["fn"], "label": key["label"],
+                     "profile": profile, "original": original}
+        macro["bound"] = bound
+        macros = [macro if m is old else m for m in macros] if old else macros + [macro]
+        save_macros(macros)
+        return {"ok": True, "id": macro["id"]}
+
+    def _delete_macro(self, macro_id):
+        macros = load_macros()
+        macro = next((m for m in macros if m.get("id") == macro_id), None)
+        if not macro:
+            raise ValueError("Unknown macro.")
+        if macro.get("bound"):
+            self._unbind(macro["bound"])
+        write_macro(self.keyboard, macro["macroSlot"], bytes(MACRO_BYTES))
+        save_macros([m for m in macros if m is not macro])
+        return {"ok": True}
+
+    def _wait(self, seconds):
+        """Sleep, but wake up for queued jobs. Returns True if one is waiting."""
+        with self.jobs_cv:
+            if not self.jobs and not self.stopping:
+                self.jobs_cv.wait(seconds)
+            return bool(self.jobs)
+
+    def loop(self):
+        last_time_sync = time.time()
+        while not self.stopping:
+            if not self.keyboard:
+                if not self._connect():
+                    self._fail_waiting_jobs()
+                    self._wait(5)
+                    continue
+                last_time_sync = time.time()
+            try:
+                with self.jobs_cv:
+                    job = self.jobs.pop(0) if self.jobs else None
+                if job:
+                    self._run_job(job)
+                    continue
+                sig = theme_signature()
+                if self.lights.get("mode") == "theme" and sig != self.theme_sig:
+                    self._apply_keys()
+                    self.theme_sig = sig
+                elif self.theme_sig is None:
+                    self._apply_keys()
+                    self.theme_sig = sig
+                if time.time() - last_time_sync > 3600:
+                    self.keyboard.send(time_report())
+                    last_time_sync = time.time()
+                    if self._wait(FIELD_SPACING):
+                        continue
+                cpu = self.cpu.percent()
+                self.keyboard.send(cpu_report(cpu))
+                self.status["cpu"] = cpu
+                if self._wait(FIELD_SPACING):
+                    continue
+                temp = read_temp(self.temp_path)
+                if temp:
+                    self.keyboard.send(temp_report(temp))
+                    self.status["temp"] = temp
+                self._wait(FIELD_SPACING)
+            except OSError as exc:
+                self._drop(exc)
+                self._wait(2)
+
+    def _fail_waiting_jobs(self):
+        with self.jobs_cv:
+            waiting, self.jobs = self.jobs, []
+        for job in waiting:
+            job["result"] = {"ok": False, "error": "The keyboard isn't connected by cable."}
+            job["done"].set()
+
+    # -- socket --
+
+    def submit(self, job):
+        job["done"] = threading.Event()
+        with self.jobs_cv:
+            self.jobs.append(job)
+            self.jobs_cv.notify_all()
+        return job
+
+    def handle(self, conn):
+        with conn:
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            try:
+                request = json.loads(data.decode() or "{}")
+            except ValueError:
+                request = {}
+            command = request.get("command")
+            if command == "status":
+                current = sorted(p for p in glob.glob(os.path.join(MEDIA_DIR, "current.*"))
+                                 if not p.endswith(".json"))
+                reply = dict(self.status, queued=len(self.jobs),
+                             preview=current[0] if current else "",
+                             palette=theme_palette())
+            elif command in ("image", "gif"):
+                path = os.path.abspath(os.path.expanduser(str(request.get("path", ""))))
+                if not os.path.isfile(path):
+                    reply = {"ok": False, "error": "No such file: " + path}
+                else:
+                    job = self.submit({"kind": command, "path": path,
+                                       "place": clean_place(request.get("place"))})
+                    job["done"].wait()
+                    reply = job["result"]
+            elif command == "lights":
+                try:
+                    lights = clean_lights(request.get("lights"))
+                except ValueError as exc:
+                    reply = {"ok": False, "error": str(exc)}
+                else:
+                    job = self.submit({"kind": "lights", "lights": lights})
+                    job["done"].wait()
+                    reply = job["result"]
+            elif command == "macro-save":
+                try:
+                    macro = clean_macro(request.get("macro"))
+                except ValueError as exc:
+                    reply = {"ok": False, "error": str(exc)}
+                else:
+                    job = self.submit({"kind": "macro-save", "macro": macro})
+                    job["done"].wait()
+                    reply = job["result"]
+            elif command in ("macro-delete", "keymap"):
+                job = self.submit({"kind": command, "id": str(request.get("id", ""))})
+                job["done"].wait()
+                reply = job["result"]
+            else:
+                reply = {"ok": False, "error": "Unknown command"}
+            try:
+                conn.sendall((json.dumps(reply) + "\n").encode())
+            except OSError:
+                pass
+
+    def serve(self):
+        os.makedirs(os.path.dirname(SOCKET_PATH), exist_ok=True)
+        try:
+            os.unlink(SOCKET_PATH)
+        except FileNotFoundError:
+            pass
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(SOCKET_PATH)
+        os.chmod(SOCKET_PATH, 0o600)
+        server.listen(4)
+        while not self.stopping:
+            ready, _, _ = select.select([server], [], [], 1)
+            if ready:
+                conn, _ = server.accept()
+                threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
+        server.close()
+        try:
+            os.unlink(SOCKET_PATH)
+        except OSError:
+            pass
+
+    def stop(self, *_args):
+        self.stopping = True
+        with self.jobs_cv:
+            self.jobs_cv.notify_all()
+
+
+def run_daemon():
+    if ask({"command": "status"}, timeout=3).get("connected") is not None:
+        print("OmaRT100 is already running.", file=sys.stderr)
+        return 0
+    daemon = Daemon()
+    signal.signal(signal.SIGTERM, daemon.stop)
+    signal.signal(signal.SIGINT, daemon.stop)
+    threading.Thread(target=daemon.serve, daemon=True).start()
+    try:
+        daemon.loop()
+    finally:
+        daemon._drop()
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Files and links for `show`
+# --------------------------------------------------------------------------- #
+
+MEDIA_DIR = os.path.join(STATE_DIR, "media")
+MAX_DOWNLOAD = 25 * 1024 * 1024
+_GIPHY = re.compile(
+    r"^https?://(?:www\.)?giphy\.com/(?:gifs|stickers|clips)/(?:[^/?#]*-)?([A-Za-z0-9]+)(?:[/?#]|$)"
+    r"|^https?://(?:media\d*|i)\.giphy\.com/(?:media/(?:v1\.[^/]+/)?)?([A-Za-z0-9]+)(?:[/.]|$)")
+
+
+def media_url(link):
+    """The direct file behind a link. GIPHY pages point at their GIF."""
+    match = _GIPHY.match(link)
+    if match:
+        return "https://i.giphy.com/%s.gif" % (match.group(1) or match.group(2))
+    return link
+
+
+def download(link):
+    import urllib.request
+    url = media_url(link.strip())
+    if not re.match(r"^https?://", url):
+        raise ValueError("Links must start with http:// or https://")
+    request = urllib.request.Request(url, headers={"User-Agent": "OmaRT100"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = response.read(MAX_DOWNLOAD + 1)
+    if len(data) > MAX_DOWNLOAD:
+        raise ValueError("That file is over 25 MB.")
+    private_state_dir()
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    path = os.path.join(MEDIA_DIR, "download-%d" % int(time.time()))
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return path
+
+
+def media_kind(path):
+    """'gif' for anything animated, 'image' for a still. Raises if unreadable."""
+    from PIL import Image
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        with Image.open(path) as image:
+            return "gif" if getattr(image, "n_frames", 1) > 1 else "image"
+    except Exception:
+        raise ValueError("That isn't a picture or GIF OmaRT100 can read.")
+
+
+def keep_copy(path, kind, place=None):
+    """Remember what's on the screen: a preview for the window, plus the
+    original file and its placement so a profile can send it again."""
+    import shutil
+    private_state_dir()
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    for old in glob.glob(os.path.join(MEDIA_DIR, "current.*")) + glob.glob(os.path.join(MEDIA_DIR, "source.*")):
+        os.unlink(old)
+    target = os.path.join(MEDIA_DIR, "current." + ("gif" if kind == "gif" else "png"))
+    if kind == "gif":
+        shutil.copyfile(path, target)
+    else:
+        from PIL import Image
+        with Image.open(path) as image:
+            _fit(image, SCREEN_SIZE, place).save(target)
+    shutil.copyfile(path, os.path.join(MEDIA_DIR, "source." + ("gif" if kind == "gif" else "img")))
+    with open(os.path.join(MEDIA_DIR, "current.json"), "w") as fh:
+        json.dump({"kind": kind, "place": clean_place(place)}, fh)
+    return target
+
+
+# --------------------------------------------------------------------------- #
+# Profiles: lights plus the screen, saved together
+# --------------------------------------------------------------------------- #
+
+PROFILES_DIR = os.path.join(STATE_DIR, "profiles")
+_PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
+
+
+def _profile_dir(profile_id):
+    if not _PROFILE_ID.match(str(profile_id)):
+        raise ValueError("Unknown profile.")
+    return os.path.join(PROFILES_DIR, profile_id)
+
+
+def profile_list():
+    active = load_settings().get("activeProfile")
+    found = []
+    for meta in glob.glob(os.path.join(PROFILES_DIR, "*", "profile.json")):
+        folder = os.path.dirname(meta)
+        try:
+            with open(meta) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        previews = glob.glob(os.path.join(folder, "preview.*"))
+        found.append({"id": os.path.basename(folder), "name": data.get("name", ""),
+                      "created": data.get("created", 0), "lights": data.get("lights"),
+                      "screen": data.get("screen"), "preview": previews[0] if previews else "",
+                      "active": os.path.basename(folder) == active})
+    found.sort(key=lambda p: p["created"])
+    return {"ok": True, "profiles": found}
+
+
+def profile_save(name):
+    import shutil
+    name = " ".join(str(name).split())[:40]
+    if not name:
+        return {"ok": False, "error": "Give the profile a name."}
+    base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "profile"
+    profile_id, n = base, 2
+    while os.path.exists(os.path.join(PROFILES_DIR, profile_id)):
+        profile_id, n = "%s-%d" % (base, n), n + 1
+    folder = _profile_dir(profile_id)
+    private_state_dir()
+    os.makedirs(folder)
+    screen = None
+    try:
+        with open(os.path.join(MEDIA_DIR, "current.json")) as fh:
+            current = json.load(fh)
+        source = glob.glob(os.path.join(MEDIA_DIR, "source.*"))
+        preview = glob.glob(os.path.join(MEDIA_DIR, "current.*"))
+        preview = [p for p in preview if not p.endswith(".json")]
+        if source and preview:
+            shutil.copyfile(source[0], os.path.join(folder, "screen" + os.path.splitext(source[0])[1]))
+            shutil.copyfile(preview[0], os.path.join(folder, "preview" + os.path.splitext(preview[0])[1]))
+            screen = {"kind": current.get("kind"), "place": clean_place(current.get("place"))}
+    except (OSError, ValueError):
+        screen = None
+    lights = load_settings().get("lights") or {"mode": "theme"}
+    with open(os.path.join(folder, "profile.json"), "w") as fh:
+        json.dump({"name": name, "created": time.time(), "lights": lights, "screen": screen}, fh, indent=1)
+    settings = load_settings()
+    settings["activeProfile"] = profile_id
+    save_settings(settings)
+    return {"ok": True, "id": profile_id}
+
+
+def _same_file(a, b):
+    try:
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            return fa.read() == fb.read()
+    except OSError:
+        return False
+
+
+def profile_apply(profile_id):
+    try:
+        folder = _profile_dir(profile_id)
+        with open(os.path.join(folder, "profile.json")) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {"ok": False, "error": "Unknown profile."}
+    reply = ask({"command": "lights", "lights": data.get("lights") or {"mode": "theme"}})
+    if not reply.get("ok"):
+        return reply
+    screen = data.get("screen")
+    files = glob.glob(os.path.join(folder, "screen.*"))
+    if screen and files:
+        # Skip the slow upload when the screen already shows this.
+        same = False
+        try:
+            with open(os.path.join(MEDIA_DIR, "current.json")) as fh:
+                current = json.load(fh)
+            source = glob.glob(os.path.join(MEDIA_DIR, "source.*"))
+            same = bool(source) and current.get("place") == clean_place(screen.get("place")) \
+                and _same_file(source[0], files[0])
+        except (OSError, ValueError):
+            same = False
+        if not same:
+            reply = show(files[0], screen.get("place"))
+            if not reply.get("ok"):
+                return reply
+    settings = load_settings()
+    settings["activeProfile"] = profile_id
+    save_settings(settings)
+    return {"ok": True, "id": profile_id}
+
+
+def profile_delete(profile_id):
+    import shutil
+    try:
+        folder = _profile_dir(profile_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    if not os.path.isfile(os.path.join(folder, "profile.json")):
+        return {"ok": False, "error": "Unknown profile."}
+    shutil.rmtree(folder)
+    settings = load_settings()
+    if settings.get("activeProfile") == profile_id:
+        settings.pop("activeProfile")
+        save_settings(settings)
+    return {"ok": True}
+
+
+def fetch(source):
+    """Make a file or link ready to adjust: a local path plus its kind."""
+    source = source.strip()
+    try:
+        if re.match(r"^https?://", source):
+            for old in glob.glob(os.path.join(MEDIA_DIR, "download-*")):
+                if time.time() - os.path.getmtime(old) > 3600:
+                    os.unlink(old)
+            path = download(source)
+        else:
+            path = os.path.abspath(os.path.expanduser(source))
+            if not os.path.isfile(path):
+                return {"ok": False, "error": "No such file: " + path}
+        kind = media_kind(path)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(getattr(exc, "reason", None) or exc)}
+    from PIL import Image
+    with Image.open(path) as image:
+        width, height = image.size
+    return {"ok": True, "path": path, "kind": kind, "width": width, "height": height}
+
+
+def show(source, place=None):
+    downloaded = None
+    try:
+        if re.match(r"^https?://", source.strip()):
+            downloaded = path = download(source)
+        else:
+            path = os.path.abspath(os.path.expanduser(source))
+            if not os.path.isfile(path):
+                return {"ok": False, "error": "No such file: " + path}
+        kind = media_kind(path)
+    except (OSError, ValueError) as exc:
+        if downloaded:
+            os.unlink(downloaded)
+        return {"ok": False, "error": str(getattr(exc, "reason", None) or exc)}
+    place = clean_place(place)
+    reply = ask({"command": kind, "path": path, "place": place})
+    if reply.get("ok"):
+        reply["kind"] = kind
+        reply["preview"] = keep_copy(path, kind, place)
+    if downloaded:
+        os.unlink(downloaded)
+    return reply
+
+
+def ask(request, timeout=600):
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    try:
+        client.connect(SOCKET_PATH)
+    except OSError:
+        return {"ok": False, "error": "The OmaRT100 service isn't running."}
+    with client:
+        client.sendall((json.dumps(request) + "\n").encode())
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    try:
+        return json.loads(data.decode())
+    except ValueError:
+        return {"ok": False, "error": "No reply from the OmaRT100 service."}
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    command = argv[0]
+    if command == "daemon":
+        return run_daemon()
+    if command == "status":
+        reply = ask({"command": "status"}, timeout=5)
+    elif command == "show" and len(argv) in (2, 3):
+        source = argv[1]
+        if source.startswith("file://"):
+            from urllib.parse import unquote
+            source = unquote(source[7:])
+        place = None
+        if len(argv) == 3:
+            try:
+                place = json.loads(argv[2])
+            except ValueError:
+                place = None
+        reply = show(source, place)
+    elif command == "fetch" and len(argv) == 2:
+        source = argv[1]
+        if source.startswith("file://"):
+            from urllib.parse import unquote
+            source = unquote(source[7:])
+        reply = fetch(source)
+    elif command in ("image", "gif") and len(argv) == 2:
+        reply = ask({"command": command, "path": os.path.abspath(argv[1])})
+    elif command == "lights" and argv[1:2] == ["theme"]:
+        reply = ask({"command": "lights", "lights": {"mode": "theme"}})
+    elif command == "lights" and len(argv) == 3 and argv[1] in ("custom", "effect"):
+        try:
+            value = json.loads(argv[2])
+        except ValueError:
+            value = None
+        reply = ask({"command": "lights", "lights": {"mode": argv[1], argv[1]: value}})
+    elif command == "profiles":
+        reply = profile_list()
+    elif command == "profile" and len(argv) == 3 and argv[1] == "save":
+        reply = profile_save(argv[2])
+    elif command == "profile" and len(argv) == 3 and argv[1] == "apply":
+        reply = profile_apply(argv[2])
+    elif command == "profile" and len(argv) == 3 and argv[1] == "delete":
+        reply = profile_delete(argv[2])
+    elif command == "macros":
+        reply = {"ok": True, "macros": load_macros()}
+    elif command == "macro" and argv[1:] == ["save"]:
+        # One line of JSON on stdin: recorded keys never go on the command line.
+        try:
+            value = json.loads(sys.stdin.readline(MAX_MACRO_JSON))
+        except ValueError:
+            value = None
+        reply = ask({"command": "macro-save", "macro": value})
+    elif command == "macro" and len(argv) == 3 and argv[1] == "delete":
+        reply = ask({"command": "macro-delete", "id": argv[2]})
+    elif command == "keymap":
+        reply = ask({"command": "keymap"}, timeout=30)
+    elif command == "effects":
+        reply = {"ok": True, "effects": [{"name": e[0], "label": e[1], "directions": e[3]}
+                                          for e in EFFECTS]}
+    else:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    print(json.dumps(reply))
+    return 0 if reply.get("ok", True) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,12 @@
+# OmaRT100: lets the person at the computer use the Epomaker RT100's control
+# channel while it is plugged in by cable (USB 3151:4010 and 3151:4015).
+#
+# uaccess grants only the user at the active local session, the same way
+# Linux handles game controllers. The file starts with 70 so it runs before
+# 73-seat-late.rules, which turns the tag into access.
+#
+# OmaRT100 opens only USB interface 2 (settings, lights, screen). Interface 0
+# carries your typing and is never opened.
+
+KERNEL=="hidraw*", ATTRS{idVendor}=="3151", ATTRS{idProduct}=="4010", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="3151", ATTRS{idProduct}=="4015", TAG+="uaccess"

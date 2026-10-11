@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.dankestrick.omart100",
+  "name": "OmaRT100",
+  "version": "0.1.0",
+  "author": "Dankestrick",
+  "license": "MIT",
+  "description": "Epomaker RT100 keyboard on Omarchy: CPU load and temperature on its screen, key lights that follow your theme's window border, and pictures or GIFs dropped onto a window (GIPHY links work).",
+  "dependencies": [
+    {
+      "name": "python",
+      "package": "python",
+      "why": "Runs the helper that talks to the keyboard"
+    },
+    {
+      "name": "Pillow",
+      "package": "python-pillow",
+      "why": "Reads and resizes pictures and GIFs for the screen"
+    },
+    {
+      "name": "zenity",
+      "package": "zenity",
+      "why": "File picker for Choose file"
+    },
+    {
+      "name": "setpriv",
+      "package": "util-linux",
+      "why": "Ends the helper together with the shell"
+    }
+  ],
+  "kinds": [
+    "service",
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "qml/Service.qml",
+    "overlay": "qml/Overlay.qml"
+  }
+}
